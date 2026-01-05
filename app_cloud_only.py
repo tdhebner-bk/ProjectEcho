@@ -100,19 +100,19 @@ q2_capacity_to_q2_pct = st.sidebar.slider(
     "Q2 Capacity Allocation to Actionable Non-Certified Backlog",
     min_value=0.0,
     max_value=1.0,
-    value=1.0,
+    value=0.40,
     step=0.05,
     help="When Tailwind is active, this % of Q2 capacity burns Actionable Non-Certified Backlog; the remainder burns Tailwind backlog."
 )
 
 st.sidebar.markdown("### Demand")
 qtr_demand_total = st.sidebar.number_input("Quarterly Demand (hours)", min_value=0.0, value=1440.0, step=50.0)
-tw_share_of_demand = st.sidebar.slider("Tailwind Share of Demand", min_value=0.0, max_value=1.0, value=0.0, step=0.05)
+tw_share_of_demand = st.sidebar.slider("Tailwind Share of Demand", min_value=0.0, max_value=1.0, value=0.75, step=0.05)
 
 tw_capacity_reduction_month = st.sidebar.number_input(
     "Tailwind Capacity Reduction Month (50%)",
     min_value=0,
-    value=0,
+    value=12,
     step=1,
     help="If set to N>0, Tailwind capacity will be cut in half starting in month N."
 )
