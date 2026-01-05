@@ -1,0 +1,371 @@
+import io
+from datetime import datetime
+
+import matplotlib.pyplot as plt
+import pandas as pd
+import streamlit as st
+
+from backlog_burndown import build_backlog_views, run_tailwind_model
+
+st.set_page_config(page_title="Backlog Burndown (Q2 + Tailwind)", layout="wide")
+st.title("Backlog Burndown Simulator (Q2 + Tailwind)")
+
+# -------------------------------------------------
+# 1. Data source (Cloud-only): Upload CSV/XLSX
+# -------------------------------------------------
+st.subheader("Data Source")
+uploaded_file = st.file_uploader(
+    "Upload CurrentSnowflakeData.csv (preferred) or an Excel extract (.xlsx)",
+    type=["csv", "xlsx"],
+    help="Upload the refreshed Snowflake extract. This cloud app does not connect to Snowflake directly."
+)
+
+if uploaded_file is None:
+    st.info("Upload the data extract to begin.")
+    st.stop()
+
+@st.cache_data(show_spinner=True)
+def load_df(file_bytes: bytes, filename: str) -> pd.DataFrame:
+    name = (filename or "").lower()
+    if name.endswith(".csv"):
+        return pd.read_csv(io.BytesIO(file_bytes))
+    return pd.read_excel(io.BytesIO(file_bytes))
+
+df_bytes = uploaded_file.getvalue()
+df = load_df(df_bytes, uploaded_file.name)
+
+# -------------------------------------------------
+# 1a. Schema validation (guardrails)
+# -------------------------------------------------
+required_cols = {
+    "Delivery Team",
+    "Project Status",
+    "Project Sub-Type",
+    "Allocated Hours (User×CWO)",
+    "Hours Logged (User×CWO)",
+    "Work Order Code",
+    "Account Name",
+    "Work Order Description",
+    "Contingent Work Order",
+    "Contingent Go-Live Date",
+    "Slotted Go-Live Date",
+}
+
+missing = sorted(list(required_cols - set(df.columns)))
+if missing:
+    st.error(
+        "The uploaded file is missing required columns:\n"
+        + "\n".join([f"- {c}" for c in missing])
+        + "\n\nEnsure the file is generated from the Snowflake BURNDOWN_SQL output used by the local refresh process."
+    )
+    st.stop()
+
+# Build views from uploaded data
+views = build_backlog_views(df)
+
+# Unpack views
+total_backlog = views["total_backlog"]
+total_TW_backlog = views["total_TW_backlog"]
+total_NANC_backlog = float(
+    views["allNANCWOs"]["Allocated_Hours"].sum() - views["allNANCWOs"]["Hours_Logged"].sum()
+)
+total_AC_backlog = float(total_backlog - total_TW_backlog - total_NANC_backlog)
+tw_shift_map = views["tw_shift_map"]
+
+# -------------------------------------------------
+# 2. Sidebar – model parameters
+# -------------------------------------------------
+st.sidebar.markdown("### Summary")
+st.sidebar.markdown(
+    f"""
+    **Total Backlog:** <span style="color:#0057ba;"><i>{total_backlog:,.0f} hrs</i></span><br>
+    **Tailwind Backlog:** <span style="color:#759243;"><i>{total_TW_backlog:,.0f} hrs</i></span><br>
+    **Non-Actionable Non-Certified Backlog:** <span style="color:#ff3319;"><i>{total_NANC_backlog:,.0f} hrs</i></span><br>
+    **Actionable Non-Certified Backlog:** <span style="color:#abf5ed;"><i>{total_AC_backlog:,.0f} hrs</i></span>
+    """,
+    unsafe_allow_html=True
+)
+
+st.sidebar.header("Model Parameters")
+
+st.sidebar.markdown("### Capacity")
+tw_headcount = st.sidebar.number_input("Tailwind Headcount (FTE)", min_value=0.0, value=6.0, step=0.1)
+q2_headcount = st.sidebar.number_input("Q2 Headcount (FTE)", min_value=0.0, value=2.0, step=0.1)
+utilization = st.sidebar.number_input("Utilization %", min_value=0.0, value=0.78, step=0.01)
+
+q2_capacity_to_q2_pct = st.sidebar.slider(
+    "Q2 Capacity Allocation to Actionable Non-Certified Backlog",
+    min_value=0.0,
+    max_value=1.0,
+    value=1.0,
+    step=0.05,
+    help="When Tailwind is active, this % of Q2 capacity burns Actionable Non-Certified Backlog; the remainder burns Tailwind backlog."
+)
+
+st.sidebar.markdown("### Demand")
+qtr_demand_total = st.sidebar.number_input("Quarterly Demand (hours)", min_value=0.0, value=1440.0, step=50.0)
+tw_share_of_demand = st.sidebar.slider("Tailwind Share of Demand", min_value=0.0, max_value=1.0, value=0.0, step=0.05)
+
+tw_capacity_reduction_month = st.sidebar.number_input(
+    "Tailwind Capacity Reduction Month (50%)",
+    min_value=0,
+    value=0,
+    step=1,
+    help="If set to N>0, Tailwind capacity will be cut in half starting in month N."
+)
+
+modify_demand_after_12_months = st.sidebar.checkbox("Modify incoming demand after 12 months?", value=False)
+post_12_qtr_demand_total = None
+if modify_demand_after_12_months:
+    post_12_qtr_demand_total = st.sidebar.number_input(
+        "Quarterly Demand After 12 Months (hours)",
+        min_value=0.0,
+        value=float(qtr_demand_total),
+        step=50.0,
+        help="Used to compute monthly incoming demand starting in month 13, until Tailwind removal (if applicable)."
+    )
+
+removal_threshold_months = st.sidebar.number_input(
+    "Tailwind Removal Threshold (backlog months, at full capacity)",
+    min_value=0.0,
+    value=4.0,
+    step=0.1
+)
+
+model_diff_demand_after_removal = st.sidebar.checkbox(
+    "Model different incoming demand after full Tailwind removal?",
+    value=False
+)
+post_removal_qtr_demand_total = None
+if model_diff_demand_after_removal:
+    post_removal_qtr_demand_total = st.sidebar.number_input(
+        "Quarterly Demand After Tailwind Removal (hours)",
+        min_value=0.0,
+        value=float(qtr_demand_total),
+        step=50.0,
+        help="Used to compute monthly incoming demand starting in the Tailwind removal threshold month."
+    )
+
+st.sidebar.markdown("### Output Preferences")
+months = st.sidebar.number_input("Simulation Horizon (months)", min_value=1, value=28, step=1)
+
+# -------------------------------------------------
+# 3. Run model
+# -------------------------------------------------
+if st.button("Run Burndown Simulation"):
+    run_id = f"ProjectEcho_BacklogSim_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+
+    df_reduced = run_tailwind_model(
+        total_backlog=total_backlog,
+        total_TW_backlog=total_TW_backlog,
+        total_NANC_backlog=total_NANC_backlog,
+        tw_headcount=tw_headcount,
+        q2_headcount=q2_headcount,
+        utilization=utilization,
+        q2_capacity_to_q2_pct=q2_capacity_to_q2_pct,
+        qtr_demand_total=qtr_demand_total,
+        tw_share_of_demand=tw_share_of_demand,
+        months=months,
+        tw_shift_map=tw_shift_map,
+        removal_threshold_months=removal_threshold_months,
+        tw_capacity_reduction_month=tw_capacity_reduction_month,
+        model_diff_demand_after_removal=model_diff_demand_after_removal,
+        post_removal_qtr_demand_total=post_removal_qtr_demand_total,
+        modify_demand_after_12_months=modify_demand_after_12_months,
+        post_12_qtr_demand_total=post_12_qtr_demand_total,
+    )
+
+    # -------------------------------------------------
+    # 3a. Downloads: parameters + tables
+    # -------------------------------------------------
+    params_text = f"""Project Echo – Backlog Burndown Simulation
+=========================================
+Run Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+Run Id: {run_id}
+
+--- Capacity Assumptions ---
+Tailwind Headcount (FTE): {tw_headcount}
+Q2 Headcount (FTE): {q2_headcount}
+Utilization Rate: {utilization:.2%}
+Q2 Capacity Allocation to Actionable: {q2_capacity_to_q2_pct:.2%}
+
+--- Demand Assumptions ---
+Quarterly Demand (hours): {qtr_demand_total:,.0f}
+Tailwind Share of Demand: {tw_share_of_demand:.2%}
+
+Modify Demand After 12 Months: {modify_demand_after_12_months}
+Quarterly Demand After 12 Months: {post_12_qtr_demand_total if post_12_qtr_demand_total is not None else 'N/A'}
+
+Model Different Demand After Tailwind Removal: {model_diff_demand_after_removal}
+Quarterly Demand After Tailwind Removal: {post_removal_qtr_demand_total if post_removal_qtr_demand_total is not None else 'N/A'}
+
+--- Structural Controls ---
+Tailwind Capacity Reduction Month (50%): {tw_capacity_reduction_month}
+Tailwind Removal Threshold (Backlog Months): {removal_threshold_months}
+
+--- Simulation Controls ---
+Simulation Horizon (months): {months}
+
+--- Initial Backlog Snapshot ---
+Total Backlog (hrs): {total_backlog:,.0f}
+Tailwind Backlog (hrs): {total_TW_backlog:,.0f}
+Non-Actionable Backlog (hrs): {total_NANC_backlog:,.0f}
+Actionable Backlog (hrs): {total_AC_backlog:,.0f}
+"""
+
+    st.subheader("Downloads")
+    st.download_button(
+        label="Download parameters (.txt)",
+        data=params_text.encode("utf-8"),
+        file_name=f"{run_id}_parameters.txt",
+        mime="text/plain",
+    )
+
+    results_csv = df_reduced.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="Download burndown results (.csv)",
+        data=results_csv,
+        file_name=f"{run_id}_burndown_results.csv",
+        mime="text/csv",
+    )
+
+    # -------------------------------------------------
+    # 3b. Display results
+    # -------------------------------------------------
+    st.subheader("Burndown Results (Tailwind Removed at Backlog Threshold)")
+    st.dataframe(df_reduced, use_container_width=True, hide_index=True)
+
+    plt.style.use("classic")
+
+    def add_labels(ax, x, y, step=1, fmt="{:,.0f}", y_offset=0):
+        for i in range(0, len(x), step):
+            val = y.iloc[i] if hasattr(y, "iloc") else y[i]
+            if val <= 0:
+                break
+            ax.annotate(
+                fmt.format(val),
+                (x.iloc[i] if hasattr(x, "iloc") else x[i], val),
+                textcoords="offset points",
+                xytext=(0, y_offset),
+                ha="center",
+                fontsize=9,
+            )
+
+    # 1) Backlog burndown – hours
+    fig1, ax1 = plt.subplots(figsize=(10, 5))
+    ax1.plot(df_reduced["Month"], df_reduced["Total_Backlog"], marker="o", label="Total Backlog")
+    ax1.plot(df_reduced["Month"], df_reduced["TW_Backlog"], marker="o", label="Tailwind Backlog")
+    ax1.plot(df_reduced["Month"], df_reduced["NANC_Backlog"], marker="o", label="Non-Actionable")
+    ax1.plot(df_reduced["Month"], df_reduced["AC_Backlog"], marker="o", label="Actionable (Q2)")
+
+    add_labels(ax1, df_reduced["Month"], df_reduced["Total_Backlog"], step=3, y_offset=8)
+    add_labels(ax1, df_reduced["Month"], df_reduced["TW_Backlog"], step=3, y_offset=-10)
+    add_labels(ax1, df_reduced["Month"], df_reduced["NANC_Backlog"], step=3, y_offset=8)
+    add_labels(ax1, df_reduced["Month"], df_reduced["AC_Backlog"], step=3, y_offset=8)
+
+    import matplotlib.ticker as ticker
+    ax1.set_xlabel("Month")
+    ax1.set_ylabel("Backlog (Hours)")
+    ax1.yaxis.set_major_formatter(ticker.StrMethodFormatter("{x:,.0f}"))
+    ax1.set_title("Backlog Burndown – Tailwind Removed at Backlog Threshold")
+    ax1.legend()
+    ax1.grid(True)
+
+    st.pyplot(fig1, use_container_width=True)
+
+    buf1 = io.BytesIO()
+    fig1.savefig(buf1, format="png", dpi=200, bbox_inches="tight")
+    buf1.seek(0)
+    st.download_button(
+        label="Download burndown chart – hours (.png)",
+        data=buf1,
+        file_name=f"{run_id}_backlog_burndown_hours.png",
+        mime="image/png",
+    )
+
+    # 2) Backlog in months
+    fig2, ax2 = plt.subplots(figsize=(10, 5))
+    ax2.plot(df_reduced["Month"], df_reduced["Backlog_Months"], marker="o", label="Backlog (Months)")
+    add_labels(ax2, df_reduced["Month"], df_reduced["Backlog_Months"], step=2, y_offset=8, fmt="{:.1f}")
+
+    ax2.set_xlabel("Month")
+    ax2.set_ylabel("Backlog (Months)")
+    ax2.set_title("Backlog in Months – Tailwind Removed at Backlog Threshold")
+    ax2.set_xlim(0, 30)
+    ax2.set_ylim(0, 15)
+    ax2.set_yticks(range(0, 16, 2))
+    ax2.legend()
+    ax2.grid(True)
+
+    st.pyplot(fig2, use_container_width=True)
+
+    buf2 = io.BytesIO()
+    fig2.savefig(buf2, format="png", dpi=200, bbox_inches="tight")
+    buf2.seek(0)
+    st.download_button(
+        label="Download burndown chart – months (.png)",
+        data=buf2,
+        file_name=f"{run_id}_backlog_burndown_months.png",
+        mime="image/png",
+    )
+
+    # -------------------------------------------------
+    # 3c. Excel exports (in-memory)
+    # -------------------------------------------------
+    nanc_df = views.get("nanc_export")
+    if nanc_df is not None and len(nanc_df) > 0:
+        nanc_xlsx = io.BytesIO()
+        with pd.ExcelWriter(nanc_xlsx, engine="openpyxl") as writer:
+            nanc_df.to_excel(writer, index=False, sheet_name="NANC")
+        nanc_xlsx.seek(0)
+
+        st.download_button(
+            label="Download NANC work orders (.xlsx)",
+            data=nanc_xlsx,
+            file_name=f"{run_id}_NANC_WorkShift.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    else:
+        st.info("No NANC work orders found to export.")
+
+    allwo_df = views.get("allwo_export")
+    if allwo_df is not None and len(allwo_df) > 0:
+        allwo_xlsx = io.BytesIO()
+        with pd.ExcelWriter(allwo_xlsx, engine="openpyxl") as writer:
+            allwo_df.to_excel(writer, index=False, sheet_name="All_Work_Orders")
+        allwo_xlsx.seek(0)
+
+        st.download_button(
+            label="Download ALL work orders export (.xlsx)",
+            data=allwo_xlsx,
+            file_name=f"{run_id}_AllWorkOrders_WorkShift.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    else:
+        st.info("No work orders found to export in allwo_export.")
+
+    # -------------------------------------------------
+    # 3d. Shift schedule table + download
+    # -------------------------------------------------
+    st.subheader("Hours Shifting to Tailwind by Month")
+
+    if isinstance(tw_shift_map, dict) and len(tw_shift_map) > 0:
+        shift_rows = [
+            {"Month": m, "Shift_Hours": float(tw_shift_map.get(m, 0.0))}
+            for m in range(1, int(months) + 1)
+        ]
+        shift_df = pd.DataFrame(shift_rows)
+
+        st.dataframe(shift_df, use_container_width=True, hide_index=True)
+
+        shift_csv = shift_df.to_csv(index=False).encode("utf-8")
+        st.download_button(
+            label="Download shift schedule (.csv)",
+            data=shift_csv,
+            file_name=f"{run_id}_shift_schedule.csv",
+            mime="text/csv",
+        )
+    else:
+        st.info("No contingent go-live shifts detected in the current dataset.")
+else:
+    st.info("Adjust parameters on the left and click 'Run Burndown Simulation'.")
