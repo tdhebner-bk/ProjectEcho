@@ -15,7 +15,7 @@ st.title("Backlog Burndown Simulator (Q2 + Tailwind)")
 # -------------------------------------------------
 st.subheader("Data Source")
 uploaded_file = st.file_uploader(
-    "Upload CurrentSnowflakeData.csv (preferred) or an Excel extract (.xlsx). . If you need the excel file, either reach out to Thomas Hebner or find the linked file path, which you should have access to: C:\Users\thebner\OneDrive - Q2e\Project Echo Simulations\CurrentSnowflakeData.csv",
+    "Upload CurrentSnowflakeData.csv (preferred) or an Excel extract (.xlsx). If you need the excel file, either reach out to Thomas Hebner or find the linked file path, which you should have access to: C:\Users\thebner\OneDrive - Q2e\Project Echo Simulations\CurrentSnowflakeData.csv",
     type=["csv", "xlsx"],
     help="Upload the refreshed Snowflake extract. This cloud app does not connect to Snowflake directly."
 )
