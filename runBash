@@ -1,0 +1,5 @@
+cd "C:\Users\thebner\PY_Analytics"
+.\.venv\Scripts\activate
+pip install "snowflake-connector-python[pandas]" streamlit matplotlib
+cd "C:\Users\thebner\PY_Analytics\Project Echo"
+streamlit run app.py
