@@ -17,7 +17,7 @@ st.subheader("Data Source")
 uploaded_file = st.file_uploader(
     "Upload CurrentSnowflakeData.csv (preferred) or an Excel extract (.xlsx). "
     "If you need the Excel file, either reach out to Thomas Hebner or find it here: "
-    + r"C:\Users\thebner\OneDrive - Q2e\Project Echo Simulations\CurrentSnowflakeData.csv",
+    + r"https://q2e-my.sharepoint.com/:x:/r/personal/thomas_hebner_q2ebanking_com/Documents/Project%20Echo%20Simulations/CurrentSnowflakeData.csv?d=w51dff6e3e0c64d3d8d8acdf659410c94&csf=1&web=1&e=5DVN6r",
     type=["csv", "xlsx"],
     help="Upload the refreshed Snowflake extract. This cloud app does not connect to Snowflake directly."
 )
