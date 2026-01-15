@@ -136,7 +136,7 @@ tw_share_of_demand = st.sidebar.slider(
     "Tailwind Share of Demand",
     min_value=0.0,
     max_value=1.0,
-    value=0.0,
+    value=0.75,
     step=0.05
 )
 
