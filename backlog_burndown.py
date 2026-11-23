@@ -3,6 +3,8 @@
 import pandas as pd
 import numpy as np
 import snowflake.connector
+import os
+
 
 # ------------------------------------------------------------------
 # 1. SNOWFLAKE QUERY + DATA LOAD
@@ -52,6 +54,7 @@ time_by_ws_user AS (
       (SUM(COALESCE(te.TIME_IN_MINUTES,0)) / 60.0)::NUMBER(18,2) AS hours_logged
   FROM Q2_ODS.MAVENLINK.TIME_ENTRY te
   WHERE te.approved = TRUE
+    AND te._FIVETRAN_DELETED = FALSE
   GROUP BY te.WORKSPACE_ID, COALESCE(te.USER_ID, -1)
 ),
 alloc_by_ws_user AS (
@@ -310,7 +313,7 @@ ORDER BY "Account Name", "Work Order Code", "Mavenlink User Name"
 
 
 def fetch_backlog_df():
-    """Pulls the raw dataframe from Snowflake using your SQL."""
+    """Pulls the raw dataframe from Snowflake and saves a CSV snapshot."""
     conn = snowflake.connector.connect(
         account="Q2-Q2EDW",
         user="THEBNER",
@@ -320,14 +323,27 @@ def fetch_backlog_df():
         schema="MAVENLINK",
         authenticator="externalbrowser",
     )
+
     cur = conn.cursor()
     try:
         cur.execute(BURNDOWN_SQL)
         df = cur.fetch_pandas_all()
-        print("✅ Projects from Snowflake successfully pulled.")
+
+        # -------------------------------------------------
+        # Persist Snowflake extract to CSV
+        # -------------------------------------------------
+        output_dir = r"C:\Users\thebner\OneDrive - Q2e\Project Echo Simulations"
+        os.makedirs(output_dir, exist_ok=True)
+
+        csv_path = os.path.join(output_dir, "CurrentSnowflakeData.csv")
+        df.to_csv(csv_path, index=False)
+
+        print(f"✅ Snowflake data pulled and saved to {csv_path}")
+
     finally:
         cur.close()
         conn.close()
+
     return df
 
 
